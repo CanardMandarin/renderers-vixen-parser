@@ -72,6 +72,10 @@ export function getProtoTypeManifestVisitor(options: {
             (): TypeManifest => ({ imports: new ImportMap(), nestedStructs: [], type: '' }),
             (_, values) => ({
                 ...mergeManifests(values),
+                definedTypes: values
+                    .map(v => v.definedTypes)
+                    .filter((d): d is string => !!d)
+                    .join('\n'),
                 type: values.map(v => v.type).join('\n'),
             }),
             { keys: [...REGISTERED_TYPE_NODE_KINDS, 'definedTypeLinkNode', 'definedTypeNode', 'accountNode'] },
@@ -93,6 +97,7 @@ export function getProtoTypeManifestVisitor(options: {
                     const childManifest = visit(arrayType.item, self);
 
                     return {
+                        definedTypes: childManifest.definedTypes,
                         imports: new ImportMap(),
                         nestedStructs: [],
                         type: `repeated ${childManifest.type}`,
@@ -400,10 +405,32 @@ export function getProtoTypeManifestVisitor(options: {
                         .filter(field => field.type !== '');
                     const fieldTypes = fields.map((field, idx) => `${field.type} = ${idx + 1};`).join('\n');
 
+                    // Collect nested type definitions from fields
+                    const nestedDefinedTypes = fields
+                        .map(f => f.definedTypes)
+                        .filter((d): d is string => !!d)
+                        .join('\n');
+
+                    const messageDefinition = `message ${pascalCase(originalParentName)} {\n${fieldTypes}\n}\n`;
+
+                    // If this is a nested struct (e.g., inside an array or field), return the definition separately
+                    if (nestedStruct || inlineStruct) {
+                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition]
+                            .filter(d => !!d)
+                            .join('\n');
+                        return {
+                            definedTypes: allDefinedTypes,
+                            imports: new ImportMap(),
+                            nestedStructs: [],
+                            type: pascalCase(originalParentName),
+                        };
+                    }
+
                     return {
+                        definedTypes: nestedDefinedTypes || undefined,
                         imports: new ImportMap(),
                         nestedStructs: [],
-                        type: `message ${pascalCase(originalParentName)} {\n${fieldTypes}\n}\n`,
+                        type: messageDefinition,
                     };
                 },
 
@@ -413,15 +440,41 @@ export function getProtoTypeManifestVisitor(options: {
                         throw new Error('Tuple type must have a parent name.');
                     }
 
-                    const fields = tupleType.items.reduce((acc, field, idx) => {
-                        const fieldManifest = visit(field, self);
-                        return `${acc}  ${fieldManifest.type} field_${idx} = ${idx + 1};\n`;
+                    const fieldManifests = tupleType.items.map((field, idx) => ({
+                        idx,
+                        manifest: visit(field, self),
+                    }));
+
+                    const fields = fieldManifests.reduce((acc, { manifest, idx }) => {
+                        return `${acc}  ${manifest.type} field_${idx} = ${idx + 1};\n`;
                     }, '');
 
+                    // Collect nested type definitions from fields
+                    const nestedDefinedTypes = fieldManifests
+                        .map(f => f.manifest.definedTypes)
+                        .filter((d): d is string => !!d)
+                        .join('\n');
+
+                    const messageDefinition = `message ${pascalCase(originalParentName)} {\n${fields}}\n`;
+
+                    // If this is a nested tuple (e.g., inside an array or field), return the definition separately
+                    if (nestedStruct || inlineStruct) {
+                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition]
+                            .filter(d => !!d)
+                            .join('\n');
+                        return {
+                            definedTypes: allDefinedTypes,
+                            imports: new ImportMap(),
+                            nestedStructs: [],
+                            type: pascalCase(originalParentName),
+                        };
+                    }
+
                     return {
+                        definedTypes: nestedDefinedTypes || undefined,
                         imports: new ImportMap(),
                         nestedStructs: [],
-                        type: `message ${pascalCase(originalParentName)} {\n${fields}}\n`,
+                        type: messageDefinition,
                     };
                 },
 
