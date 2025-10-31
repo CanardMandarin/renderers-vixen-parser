@@ -72,6 +72,10 @@ export function getProtoTypeManifestVisitor(options: {
             (): TypeManifest => ({ imports: new ImportMap(), nestedStructs: [], type: '' }),
             (_, values) => ({
                 ...mergeManifests(values),
+                definedTypes: values
+                    .map(v => v.definedTypes)
+                    .filter((d): d is string => !!d)
+                    .join('\n'),
                 type: values.map(v => v.type).join('\n'),
             }),
             { keys: [...REGISTERED_TYPE_NODE_KINDS, 'definedTypeLinkNode', 'definedTypeNode', 'accountNode'] },
@@ -93,6 +97,7 @@ export function getProtoTypeManifestVisitor(options: {
                     const childManifest = visit(arrayType.item, self);
 
                     return {
+                        definedTypes: childManifest.definedTypes,
                         imports: new ImportMap(),
                         nestedStructs: [],
                         type: `repeated ${childManifest.type}`,
@@ -171,6 +176,7 @@ export function getProtoTypeManifestVisitor(options: {
                     parentName = originalParentName;
 
                     return {
+                        definedTypes: typeManifest.definedTypes,
                         imports: new ImportMap(),
                         nestedStructs: [],
                         type: typeManifest.type,
@@ -190,6 +196,7 @@ export function getProtoTypeManifestVisitor(options: {
                     parentName = originalParentName;
 
                     return {
+                        definedTypes: childManifest.definedTypes,
                         imports: new ImportMap(),
                         nestedStructs: [],
                         type: `${childManifest.type}`,
@@ -205,9 +212,9 @@ export function getProtoTypeManifestVisitor(options: {
 
                     const variantNames = enumType.variants.map(variant => variant.name);
                     const variants = enumType.variants.map(variant => visit(variant, self));
-                    const variantTypes = variants.map(v => v.type);
 
-                    const enumHasDefinedType = variantTypes.some(type => type.includes('message'));
+                    // Check if enum has non-empty variants (either with message or definedTypes)
+                    const enumHasDefinedType = variants.some(v => v.type.includes('message') || v.definedTypes);
 
                     // If the enum has no defined type, we can just use the variant names as the enum type.
                     if (!enumHasDefinedType) {
@@ -232,26 +239,35 @@ export function getProtoTypeManifestVisitor(options: {
                         .join('\n');
 
                     const nestedVariantTypes: string[] = [];
-                    for (let i = 0; i < variantTypes.length; i++) {
-                        const variant = variantTypes[i];
-                        const variantTypeArray = variant.split(' ');
-                        const name = variantTypeArray[variantTypeArray.length - 1];
-                        const outerType = variantTypeArray[0];
-                        const isVariantEmpty = enumType.variants[i].kind === 'enumEmptyVariantTypeNode';
+                    for (let i = 0; i < variants.length; i++) {
+                        const variantManifest = variants[i];
+                        const variantNode = enumType.variants[i];
+                        const isVariantEmpty = variantNode.kind === 'enumEmptyVariantTypeNode';
 
-                        // handle nested Tuple types
-                        if (outerType === 'repeated') {
-                            const innerType = variant.split(' ').slice(1, -1).join(' ');
+                        // If the variant has definedTypes, use those
+                        if (variantManifest.definedTypes) {
+                            nestedVariantTypes.push(variantManifest.definedTypes);
+                        }
+                        // Legacy: handle nested Tuple types (when type starts with "repeated message")
+                        else if (
+                            variantManifest.type.startsWith('repeated ') &&
+                            variantManifest.type.includes('message')
+                        ) {
+                            const innerType = variantManifest.type.split(' ').slice(1, -1).join(' ');
+                            const name = variantManifest.type.split(' ').pop() || '';
                             nestedVariantTypes.push(
-                                `message ${pascalCase(name)} {\n\t${innerType} ${snakeCase(name)} = ${i + 1};\n}\n`,
+                                `message ${pascalCase(name)} {\n\t${innerType} ${snakeCase(name)} = 1;\n}\n`,
                             );
-                            // handle nested Struct types
-                        } else if (outerType === 'message') {
-                            nestedVariantTypes.push(variant);
-                        } else if (isVariantEmpty) {
-                            // If variant was empty but enum contains a mix of empty and non-empty variants, we also add a
-                            //  marker empty msg for the empty variant.
-                            nestedVariantTypes.push(`message ${pascalCase(originalParentName) + variant} { }\n`);
+                        }
+                        // Legacy: handle nested Struct types (when type starts with "message")
+                        else if (variantManifest.type.startsWith('message ')) {
+                            nestedVariantTypes.push(variantManifest.type);
+                        }
+                        // If variant is empty but enum contains a mix of empty and non-empty variants, add a marker empty msg
+                        else if (isVariantEmpty && enumHasDefinedType) {
+                            nestedVariantTypes.push(
+                                `message ${pascalCase(originalParentName) + pascalCase(variantNode.name)} { }\n`,
+                            );
                         }
                     }
                     const additionalTypes: string[] = [];
@@ -400,10 +416,30 @@ export function getProtoTypeManifestVisitor(options: {
                         .filter(field => field.type !== '');
                     const fieldTypes = fields.map((field, idx) => `${field.type} = ${idx + 1};`).join('\n');
 
+                    // Collect nested type definitions from fields
+                    const nestedDefinedTypes = fields
+                        .map(f => f.definedTypes)
+                        .filter((d): d is string => !!d)
+                        .join('\n');
+
+                    const messageDefinition = `message ${pascalCase(originalParentName)} {\n${fieldTypes}\n}\n`;
+
+                    // If this is a nested struct (e.g., inside an array or field), return the definition separately
+                    if (nestedStruct || inlineStruct) {
+                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition].filter(d => !!d).join('\n');
+                        return {
+                            definedTypes: allDefinedTypes,
+                            imports: new ImportMap(),
+                            nestedStructs: [],
+                            type: pascalCase(originalParentName),
+                        };
+                    }
+
                     return {
+                        definedTypes: nestedDefinedTypes || undefined,
                         imports: new ImportMap(),
                         nestedStructs: [],
-                        type: `message ${pascalCase(originalParentName)} {\n${fieldTypes}\n}\n`,
+                        type: messageDefinition,
                     };
                 },
 
@@ -413,15 +449,39 @@ export function getProtoTypeManifestVisitor(options: {
                         throw new Error('Tuple type must have a parent name.');
                     }
 
-                    const fields = tupleType.items.reduce((acc, field, idx) => {
-                        const fieldManifest = visit(field, self);
-                        return `${acc}  ${fieldManifest.type} field_${idx} = ${idx + 1};\n`;
+                    const fieldManifests = tupleType.items.map((field, idx) => ({
+                        idx,
+                        manifest: visit(field, self),
+                    }));
+
+                    const fields = fieldManifests.reduce((acc, { manifest, idx }) => {
+                        return `${acc}  ${manifest.type} field_${idx} = ${idx + 1};\n`;
                     }, '');
 
+                    // Collect nested type definitions from fields
+                    const nestedDefinedTypes = fieldManifests
+                        .map(f => f.manifest.definedTypes)
+                        .filter((d): d is string => !!d)
+                        .join('\n');
+
+                    const messageDefinition = `message ${pascalCase(originalParentName)} {\n${fields}}\n`;
+
+                    // If this is a nested tuple (e.g., inside an array or field), return the definition separately
+                    if (nestedStruct || inlineStruct) {
+                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition].filter(d => !!d).join('\n');
+                        return {
+                            definedTypes: allDefinedTypes,
+                            imports: new ImportMap(),
+                            nestedStructs: [],
+                            type: pascalCase(originalParentName),
+                        };
+                    }
+
                     return {
+                        definedTypes: nestedDefinedTypes || undefined,
                         imports: new ImportMap(),
                         nestedStructs: [],
-                        type: `message ${pascalCase(originalParentName)} {\n${fields}}\n`,
+                        type: messageDefinition,
                     };
                 },
 

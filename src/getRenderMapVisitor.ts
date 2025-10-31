@@ -202,6 +202,12 @@ function getArrayTypeTransform(item: TypeNode, outerTypeName: string, idlDefined
             return `self.${outerTypeName}`;
         }
 
+        case 'tupleTypeNode':
+        case 'structTypeNode': {
+            // Tuples and structs need to be transformed to their proto message types
+            return `self.${outerTypeName}.into_iter().map(|x| x.into_proto()).collect()`;
+        }
+
         default:
             console.warn(`Warning!: Default case for array type: ${item.kind} for type ${outerTypeName}`);
             return `self.${outerTypeName}.to_vec()`;
@@ -646,6 +652,105 @@ export function getRenderMapVisitor(options: GetRenderMapOptions) {
                             name: string;
                             variants: { fields_transform: string; name: string; variant_fields: string }[];
                         }[] = [];
+                        const protoTypesHelpersTuples: {
+                            fields: {
+                                name: string;
+                                needsSomeWrapping: boolean;
+                                sourceType: string;
+                                transform: string;
+                            }[];
+                            name: string;
+                            protoTypeName: string;
+                        }[] = [];
+
+                        // Helper function to collect tuple types that need IntoProto implementations
+                        const collectTupleHelpers = (typeNode: TypeNode, parentName: string, fieldName: string) => {
+                            // Check for direct array of tuples: Vec<(A, B)>
+                            let arrayNode: TypeNode | null = null;
+                            if (typeNode.kind === 'arrayTypeNode') {
+                                arrayNode = typeNode;
+                            }
+                            // Check for optional array of tuples: Option<Vec<(A, B)>>
+                            else if (typeNode.kind === 'optionTypeNode' && typeNode.item.kind === 'arrayTypeNode') {
+                                arrayNode = typeNode.item;
+                            }
+                            // Check for fixed size array of tuples: [A; N]
+                            else if (typeNode.kind === 'fixedSizeTypeNode' && typeNode.type.kind === 'arrayTypeNode') {
+                                arrayNode = typeNode.type;
+                            }
+
+                            // If we found an array node, check if it contains tuples
+                            if (
+                                arrayNode &&
+                                arrayNode.kind === 'arrayTypeNode' &&
+                                arrayNode.item.kind === 'tupleTypeNode'
+                            ) {
+                                const tupleItems = arrayNode.item.items;
+                                const protoTypeName = `${pascalCase(parentName)}${pascalCase(fieldName)}`;
+
+                                const fields = tupleItems.map((item, idx) => {
+                                    const fieldName = `field_${idx}`;
+                                    const fullTransform = getTransform(item, fieldName, types, { isEnumVariant: true });
+                                    const transformWithoutSelf = fullTransform.replace(/^self\./, '');
+
+                                    // Extract just the operation part (e.g., " as i32" or ".into_proto()")
+                                    // by removing the field name prefix
+                                    let transformOp = '';
+                                    if (transformWithoutSelf === fieldName) {
+                                        // No transformation needed
+                                        transformOp = '';
+                                    } else if (transformWithoutSelf.startsWith(fieldName)) {
+                                        // Extract the operation after the field name
+                                        transformOp = transformWithoutSelf.substring(fieldName.length);
+                                    } else {
+                                        // Use the whole transform (shouldn't happen)
+                                        transformOp = transformWithoutSelf;
+                                    }
+
+                                    // Check if this is a struct/enum type that needs Some() wrapping
+                                    // In proto3, message types are implicitly optional
+                                    let needsSomeWrapping = false;
+                                    if (item.kind === 'definedTypeLinkNode') {
+                                        const definedType = types.find(dt => dt.name === item.name);
+                                        if (
+                                            definedType &&
+                                            (definedType.type.kind === 'structTypeNode' ||
+                                                (definedType.type.kind === 'enumTypeNode' &&
+                                                    !isEnumEmptyVariant(definedType.type)))
+                                        ) {
+                                            needsSomeWrapping = true;
+                                        }
+                                    }
+
+                                    let sourceType = '';
+                                    if (item.kind === 'definedTypeLinkNode') {
+                                        sourceType = pascalCase(item.name);
+                                    } else if (item.kind === 'numberTypeNode') {
+                                        sourceType = item.format;
+                                    }
+
+                                    return {
+                                        name: fieldName,
+                                        needsSomeWrapping,
+                                        sourceType,
+                                        transform: transformOp,
+                                    };
+                                });
+
+                                // Check if we already have this tuple type (to avoid duplicates)
+                                const alreadyExists = protoTypesHelpersTuples.some(
+                                    helper => helper.protoTypeName === protoTypeName,
+                                );
+
+                                if (!alreadyExists) {
+                                    protoTypesHelpersTuples.push({
+                                        fields,
+                                        name: snakeCase(parentName),
+                                        protoTypeName,
+                                    });
+                                }
+                            }
+                        };
 
                         const protoTypes = types.map(type => {
                             const node = visit(type, typeManifestVisitor);
@@ -656,6 +761,9 @@ export function getRenderMapVisitor(options: GetRenderMapOptions) {
 
                             if (type.type.kind === 'structTypeNode') {
                                 const fields = type.type.fields.map(field => {
+                                    // Collect tuple helpers for array of tuples
+                                    collectTupleHelpers(field.type, type.name, field.name);
+
                                     return {
                                         name: snakeCase(field.name),
                                         transform: getTransform(field.type, field.name, types),
@@ -774,7 +882,11 @@ export function getRenderMapVisitor(options: GetRenderMapOptions) {
                             }),
                         );
 
-                        if (protoTypesHelpers.length > 0 || protoTypesHelpersEnums.length > 0) {
+                        if (
+                            protoTypesHelpers.length > 0 ||
+                            protoTypesHelpersEnums.length > 0 ||
+                            protoTypesHelpersTuples.length > 0
+                        ) {
                             hasProtoHelpers = true;
 
                             const normalizeAcronyms = (str: string) => {
@@ -783,6 +895,25 @@ export function getRenderMapVisitor(options: GetRenderMapOptions) {
                                 });
                             };
 
+                            // Collect types that are already imported from struct and enum helpers
+                            const alreadyImportedTypes = new Set<string>();
+                            protoTypesHelpers.forEach(helper => {
+                                alreadyImportedTypes.add(pascalCase(helper.name));
+                            });
+                            protoTypesHelpersEnums.forEach(helper => {
+                                alreadyImportedTypes.add(pascalCase(helper.name));
+                            });
+
+                            // Collect unique types used in tuples for imports, excluding already imported types
+                            const tupleImportTypes = new Set<string>();
+                            protoTypesHelpersTuples.forEach(helper => {
+                                helper.fields.forEach(field => {
+                                    if (field.sourceType && !alreadyImportedTypes.has(field.sourceType)) {
+                                        tupleImportTypes.add(field.sourceType);
+                                    }
+                                });
+                            });
+
                             renderMap = addToRenderMap(
                                 renderMap,
                                 `src/generated_parser/proto_helpers.rs`,
@@ -790,6 +921,8 @@ export function getRenderMapVisitor(options: GetRenderMapOptions) {
                                     normalizeAcronyms,
                                     protoTypesHelpers,
                                     protoTypesHelpersEnums,
+                                    protoTypesHelpersTuples,
+                                    tupleImportTypes: Array.from(tupleImportTypes),
                                 }),
                             );
                         }
