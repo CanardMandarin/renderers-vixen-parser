@@ -176,6 +176,7 @@ export function getProtoTypeManifestVisitor(options: {
                     parentName = originalParentName;
 
                     return {
+                        definedTypes: typeManifest.definedTypes,
                         imports: new ImportMap(),
                         nestedStructs: [],
                         type: typeManifest.type,
@@ -195,6 +196,7 @@ export function getProtoTypeManifestVisitor(options: {
                     parentName = originalParentName;
 
                     return {
+                        definedTypes: childManifest.definedTypes,
                         imports: new ImportMap(),
                         nestedStructs: [],
                         type: `${childManifest.type}`,
@@ -210,9 +212,9 @@ export function getProtoTypeManifestVisitor(options: {
 
                     const variantNames = enumType.variants.map(variant => variant.name);
                     const variants = enumType.variants.map(variant => visit(variant, self));
-                    const variantTypes = variants.map(v => v.type);
 
-                    const enumHasDefinedType = variantTypes.some(type => type.includes('message'));
+                    // Check if enum has non-empty variants (either with message or definedTypes)
+                    const enumHasDefinedType = variants.some(v => v.type.includes('message') || v.definedTypes);
 
                     // If the enum has no defined type, we can just use the variant names as the enum type.
                     if (!enumHasDefinedType) {
@@ -237,26 +239,35 @@ export function getProtoTypeManifestVisitor(options: {
                         .join('\n');
 
                     const nestedVariantTypes: string[] = [];
-                    for (let i = 0; i < variantTypes.length; i++) {
-                        const variant = variantTypes[i];
-                        const variantTypeArray = variant.split(' ');
-                        const name = variantTypeArray[variantTypeArray.length - 1];
-                        const outerType = variantTypeArray[0];
-                        const isVariantEmpty = enumType.variants[i].kind === 'enumEmptyVariantTypeNode';
+                    for (let i = 0; i < variants.length; i++) {
+                        const variantManifest = variants[i];
+                        const variantNode = enumType.variants[i];
+                        const isVariantEmpty = variantNode.kind === 'enumEmptyVariantTypeNode';
 
-                        // handle nested Tuple types
-                        if (outerType === 'repeated') {
-                            const innerType = variant.split(' ').slice(1, -1).join(' ');
+                        // If the variant has definedTypes, use those
+                        if (variantManifest.definedTypes) {
+                            nestedVariantTypes.push(variantManifest.definedTypes);
+                        }
+                        // Legacy: handle nested Tuple types (when type starts with "repeated message")
+                        else if (
+                            variantManifest.type.startsWith('repeated ') &&
+                            variantManifest.type.includes('message')
+                        ) {
+                            const innerType = variantManifest.type.split(' ').slice(1, -1).join(' ');
+                            const name = variantManifest.type.split(' ').pop() || '';
                             nestedVariantTypes.push(
-                                `message ${pascalCase(name)} {\n\t${innerType} ${snakeCase(name)} = ${i + 1};\n}\n`,
+                                `message ${pascalCase(name)} {\n\t${innerType} ${snakeCase(name)} = 1;\n}\n`,
                             );
-                            // handle nested Struct types
-                        } else if (outerType === 'message') {
-                            nestedVariantTypes.push(variant);
-                        } else if (isVariantEmpty) {
-                            // If variant was empty but enum contains a mix of empty and non-empty variants, we also add a
-                            //  marker empty msg for the empty variant.
-                            nestedVariantTypes.push(`message ${pascalCase(originalParentName) + variant} { }\n`);
+                        }
+                        // Legacy: handle nested Struct types (when type starts with "message")
+                        else if (variantManifest.type.startsWith('message ')) {
+                            nestedVariantTypes.push(variantManifest.type);
+                        }
+                        // If variant is empty but enum contains a mix of empty and non-empty variants, add a marker empty msg
+                        else if (isVariantEmpty && enumHasDefinedType) {
+                            nestedVariantTypes.push(
+                                `message ${pascalCase(originalParentName) + pascalCase(variantNode.name)} { }\n`,
+                            );
                         }
                     }
                     const additionalTypes: string[] = [];
@@ -415,9 +426,7 @@ export function getProtoTypeManifestVisitor(options: {
 
                     // If this is a nested struct (e.g., inside an array or field), return the definition separately
                     if (nestedStruct || inlineStruct) {
-                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition]
-                            .filter(d => !!d)
-                            .join('\n');
+                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition].filter(d => !!d).join('\n');
                         return {
                             definedTypes: allDefinedTypes,
                             imports: new ImportMap(),
@@ -459,9 +468,7 @@ export function getProtoTypeManifestVisitor(options: {
 
                     // If this is a nested tuple (e.g., inside an array or field), return the definition separately
                     if (nestedStruct || inlineStruct) {
-                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition]
-                            .filter(d => !!d)
-                            .join('\n');
+                        const allDefinedTypes = [nestedDefinedTypes, messageDefinition].filter(d => !!d).join('\n');
                         return {
                             definedTypes: allDefinedTypes,
                             imports: new ImportMap(),
